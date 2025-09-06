@@ -3,15 +3,14 @@ import * as XLSX from 'xlsx';
 import JSZip from 'jszip';
 import type { ParsedPayload, Contact, Message, Invite, CompanyFollow, SavedJob } from '../types/parser';
 
-// Simple hash function for stable IDs
-function simpleHash(input: string): string {
-  let hash = 0;
-  for (let i = 0; i < input.length; i++) {
-    const char = input.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash; // Convert to 32-bit integer
-  }
-  return Math.abs(hash).toString(36);
+// SHA-1 based deterministic hash function
+async function stableHash(input: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(input);
+  const hashBuffer = await crypto.subtle.digest('SHA-1', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  return hashHex.substring(0, 12); // Use first 12 chars for shorter IDs
 }
 
 // Normalize text: trim, collapse spaces, remove BOM
@@ -53,12 +52,32 @@ function getDayBucket(ts: string): string {
   }
 }
 
+// Header alias matching
+function findHeaderIndex(headers: string[], aliases: (string | RegExp)[]): number {
+  for (let i = 0; i < headers.length; i++) {
+    const header = headers[i];
+    for (const alias of aliases) {
+      if (alias instanceof RegExp) {
+        if (alias.test(header)) return i;
+      } else {
+        if (header === alias) return i;
+      }
+    }
+  }
+  return -1;
+}
+
+// Get value by header aliases
+function getValueByAliases(row: any[], headers: string[], aliases: (string | RegExp)[]): string {
+  const index = findHeaderIndex(headers, aliases);
+  return index >= 0 ? normalizeText(row[index]) : '';
+}
+
 // Parse CSV content
 function parseCSV(content: string): any[] {
   const result = Papa.parse(content, {
-    header: true,
-    skipEmptyLines: true,
-    transformHeader: (header) => normalizeText(header),
+    header: false, // We'll handle headers manually
+    skipEmptyLines: false, // We need to see all rows for header detection
     transform: (value) => normalizeText(value)
   });
   
@@ -76,263 +95,9 @@ function parseXLSX(buffer: ArrayBuffer): any[] {
     defval: ''
   }) as any[][];
   
-  if (jsonData.length < 2) return [];
-  
-  const headers = jsonData[0].map((h: any) => normalizeText(String(h)));
-  const rows = jsonData.slice(1);
-  
-  return rows.map(row => {
-    const obj: any = {};
-    headers.forEach((header, index) => {
-      obj[header] = normalizeText(String(row[index] || ''));
-    });
-    return obj;
-  });
-}
-
-// Process Connections file
-function processConnections(data: any[], warnings: string[]): Contact[] {
-  const contacts: Contact[] = [];
-  
-  // Skip "Notes:" lines at the beginning
-  let startIndex = 0;
-  for (let i = 0; i < Math.min(5, data.length); i++) {
-    const row = data[i];
-    if (row && typeof row === 'object') {
-      const firstKey = Object.keys(row)[0];
-      if (firstKey && firstKey.toLowerCase().includes('first name')) {
-        startIndex = i;
-        break;
-      }
-    }
-  }
-  
-  const validData = data.slice(startIndex);
-  
-  for (const row of validData) {
-    const firstName = normalizeText(row['First Name']);
-    const lastName = normalizeText(row['Last Name']);
-    const url = normalizeText(row['URL']);
-    const company = normalizeText(row['Company']);
-    const position = normalizeText(row['Position']);
-    const connectedOn = normalizeText(row['Connected On']);
-    const location = normalizeText(row['Location']);
-    
-    if (!firstName && !lastName) {
-      warnings.push('Connections: Dropped row with no name');
-      continue;
-    }
-    
-    const name = `${firstName} ${lastName}`.trim();
-    const connectedAt = parseTimestamp(connectedOn);
-    
-    if (connectedOn && !connectedAt) {
-      warnings.push(`Connections: Could not parse date "${connectedOn}"`);
-    }
-    
-    const idSource = url || `${name}|${company}|${connectedAt}`;
-    const id = simpleHash(idSource);
-    
-    contacts.push({
-      id,
-      name,
-      title: position || undefined,
-      company: company || undefined,
-      location: location || undefined,
-      connectedAt,
-      url: url || undefined
-    });
-  }
-  
-  return contacts;
-}
-
-// Process Messages file
-function processMessages(data: any[], warnings: string[]): Message[] {
-  const messages: Message[] = [];
-  
-  for (const row of data) {
-    const conversationId = normalizeText(row['CONVERSATION ID'] || row['conversation id']);
-    const from = normalizeText(row['FROM'] || row['from']);
-    const senderUrl = normalizeText(row['SENDER PROFILE URL'] || row['sender profile url']);
-    const to = normalizeText(row['TO'] || row['to']);
-    const recipientUrls = normalizeText(row['RECIPIENT PROFILE URLS'] || row['recipient profile urls']);
-    const date = normalizeText(row['DATE'] || row['date']);
-    const content = normalizeText(row['CONTENT'] || row['content']);
-    
-    if (!content) {
-      warnings.push('Messages: Dropped row with no content');
-      continue;
-    }
-    
-    const ts = parseTimestamp(date);
-    if (date && !ts) {
-      warnings.push(`Messages: Could not parse date "${date}"`);
-    }
-    
-    // Determine meOrThem
-    const meOrThem = from.toLowerCase().includes('you') ? 'me' : 'them';
-    
-    // Determine threadId
-    let threadId: string;
-    if (conversationId) {
-      threadId = conversationId;
-    } else {
-      // Fallback logic
-      const recipients = recipientUrls.split(',').map(url => normalizeText(url)).filter(Boolean);
-      
-      if (recipients.length === 1) {
-        threadId = simpleHash(recipients[0]);
-      } else if (recipients.length > 1) {
-        const sortedUrls = recipients.sort().join('|');
-        threadId = simpleHash(sortedUrls);
-      } else {
-        const participant = to || from;
-        const dayBucket = getDayBucket(ts);
-        threadId = simpleHash(`${participant}|${dayBucket}`);
-      }
-    }
-    
-    // Determine otherId
-    let otherId = '';
-    if (meOrThem === 'them') {
-      otherId = senderUrl;
-    } else {
-      const recipients = recipientUrls.split(',').map(url => normalizeText(url)).filter(Boolean);
-      otherId = recipients[0] || '';
-    }
-    
-    const id = simpleHash(`${threadId}|${ts}|${content.substring(0, 40)}`);
-    
-    messages.push({
-      id,
-      threadId,
-      meOrThem,
-      otherId,
-      body: content,
-      ts
-    });
-  }
-  
-  return messages;
-}
-
-// Process Invitations file
-function processInvitations(data: any[], warnings: string[]): Invite[] {
-  const invites: Invite[] = [];
-  
-  for (const row of data) {
-    const from = normalizeText(row['From']);
-    const to = normalizeText(row['To']);
-    const sentAt = normalizeText(row['Sent At']);
-    const message = normalizeText(row['Message']);
-    const direction = normalizeText(row['Direction']);
-    
-    if (!from && !to) {
-      warnings.push('Invitations: Dropped row with no participants');
-      continue;
-    }
-    
-    const ts = parseTimestamp(sentAt);
-    if (sentAt && !ts) {
-      warnings.push(`Invitations: Could not parse date "${sentAt}"`);
-    }
-    
-    // Determine direction
-    let inviteDirection: 'sent' | 'received';
-    if (direction.toLowerCase().includes('outgoing')) {
-      inviteDirection = 'sent';
-    } else if (direction.toLowerCase().includes('incoming')) {
-      inviteDirection = 'received';
-    } else {
-      inviteDirection = from.toLowerCase().includes('you') ? 'sent' : 'received';
-    }
-    
-    const counterpartName = inviteDirection === 'sent' ? to : from;
-    const id = simpleHash(`${inviteDirection}|${counterpartName}|${ts}`);
-    
-    invites.push({
-      id,
-      direction: inviteDirection,
-      counterpartName,
-      status: 'unknown',
-      message: message || undefined,
-      ts
-    });
-  }
-  
-  return invites;
-}
-
-// Process Company Follows file
-function processCompanyFollows(data: any[], warnings: string[]): CompanyFollow[] {
-  const follows: CompanyFollow[] = [];
-  
-  for (const row of data) {
-    const organization = normalizeText(row['Organization']);
-    const followedOn = normalizeText(row['Followed On']);
-    
-    if (!organization) {
-      warnings.push('Company Follows: Dropped row with no organization');
-      continue;
-    }
-    
-    const ts = parseTimestamp(followedOn);
-    if (followedOn && !ts) {
-      warnings.push(`Company Follows: Could not parse date "${followedOn}"`);
-    }
-    
-    const id = simpleHash(`${organization}|${ts}`);
-    
-    follows.push({
-      id,
-      company: organization,
-      ts
-    });
-  }
-  
-  return follows;
-}
-
-// Process Saved Jobs file
-function processSavedJobs(data: any[], warnings: string[], isApplications = false): SavedJob[] {
-  const jobs: SavedJob[] = [];
-  
-  for (const row of data) {
-    const company = normalizeText(row['Company']);
-    const title = normalizeText(row['Title']);
-    
-    // Find date field
-    let dateValue = '';
-    const possibleDateFields = ['Date', 'Application Date', 'Applied Date'];
-    for (const field of possibleDateFields) {
-      if (row[field]) {
-        dateValue = normalizeText(row[field]);
-        break;
-      }
-    }
-    
-    if (!company || !title) {
-      warnings.push(`${isApplications ? 'Job Applications' : 'Saved Jobs'}: Dropped row missing company or title`);
-      continue;
-    }
-    
-    const ts = parseTimestamp(dateValue);
-    if (dateValue && !ts) {
-      warnings.push(`${isApplications ? 'Job Applications' : 'Saved Jobs'}: Could not parse date "${dateValue}"`);
-    }
-    
-    const id = simpleHash(`${company}|${title}|${ts}`);
-    
-    jobs.push({
-      id,
-      company,
-      title,
-      ts
-    });
-  }
-  
-  return jobs;
+  return jsonData.map(row => 
+    row.map((cell: any) => normalizeText(String(cell || '')))
+  );
 }
 
 // Extract files from ZIP
@@ -372,6 +137,375 @@ async function extractZipFiles(zipFile: File): Promise<{ name: string; content: 
   return extractedFiles;
 }
 
+// Process Connections file with robust header detection
+async function processConnections(rawData: any[], warnings: string[], fileName: string): Promise<Contact[]> {
+  const contacts: Contact[] = [];
+  
+  // Find header row by looking for "First Name"
+  let headerRowIndex = -1;
+  let headers: string[] = [];
+  
+  for (let i = 0; i < Math.min(10, rawData.length); i++) {
+    const row = rawData[i];
+    if (Array.isArray(row)) {
+      const hasFirstName = row.some(cell => normalizeText(cell) === 'First Name');
+      if (hasFirstName) {
+        headerRowIndex = i;
+        headers = row.map(cell => normalizeText(cell));
+        break;
+      }
+    }
+  }
+  
+  if (headerRowIndex === -1) {
+    warnings.push(`Connections: Could not find header row with "First Name" in ${fileName}`);
+    return contacts;
+  }
+  
+  const dataRows = rawData.slice(headerRowIndex + 1).filter(row => 
+    Array.isArray(row) && row.some(cell => normalizeText(cell))
+  );
+  
+  // Diagnostics
+  warnings.push(`Connections: Detected headers: ${headers.join(' | ')}`);
+  warnings.push(`Connections: ${dataRows.length} data rows found in ${fileName}`);
+  
+  // Header aliases
+  const aliases = {
+    firstName: ["First Name"],
+    lastName: ["Last Name"],
+    url: ["URL", "Profile URL"],
+    email: ["Email Address", "Email"],
+    company: ["Company", "Company Name"],
+    position: ["Position", "Title", "Job Title"],
+    connected: ["Connected On", "Connected on", "Connected"],
+    location: ["Location", "City", "City, State", "City/Region"]
+  };
+  
+  let processedCount = 0;
+  for (const row of dataRows) {
+    const firstName = getValueByAliases(row, headers, aliases.firstName);
+    const lastName = getValueByAliases(row, headers, aliases.lastName);
+    const url = getValueByAliases(row, headers, aliases.url);
+    const email = getValueByAliases(row, headers, aliases.email);
+    const company = getValueByAliases(row, headers, aliases.company);
+    const position = getValueByAliases(row, headers, aliases.position);
+    const connectedOn = getValueByAliases(row, headers, aliases.connected);
+    const location = getValueByAliases(row, headers, aliases.location);
+    
+    // Don't drop rows with missing fields, just use defaults
+    const name = `${firstName} ${lastName}`.trim() || 'Unknown';
+    const connectedAt = parseTimestamp(connectedOn);
+    
+    if (connectedOn && !connectedAt) {
+      warnings.push(`Connections: Could not parse date "${connectedOn}"`);
+    }
+    
+    const idSource = url || `${name}|${company}|${connectedAt}`;
+    const id = await stableHash(idSource);
+    
+    contacts.push({
+      id,
+      name,
+      title: position || undefined,
+      company: company || undefined,
+      location: location || undefined,
+      connectedAt,
+      url: url || undefined
+    });
+    
+    processedCount++;
+  }
+  
+  warnings.push(`Connections: ${processedCount} contacts processed from ${fileName}`);
+  return contacts;
+}
+
+// Process Messages file with robust header detection
+async function processMessages(rawData: any[], warnings: string[], fileName: string): Promise<Message[]> {
+  const messages: Message[] = [];
+  
+  if (rawData.length < 2) {
+    warnings.push(`Messages: Insufficient data in ${fileName}`);
+    return messages;
+  }
+  
+  const headers = rawData[0].map((cell: any) => normalizeText(cell));
+  const dataRows = rawData.slice(1).filter(row => 
+    Array.isArray(row) && row.some(cell => normalizeText(cell))
+  );
+  
+  // Diagnostics
+  warnings.push(`Messages: Detected headers: ${headers.join(' | ')}`);
+  warnings.push(`Messages: ${dataRows.length} data rows found in ${fileName}`);
+  
+  // Header aliases (case-insensitive regex)
+  const aliases = {
+    convoId: [/^CONVERSATION ID$/i],
+    from: [/^FROM$/i],
+    to: [/^TO$/i],
+    fromUrl: [/SENDER PROFILE URL/i],
+    toUrls: [/RECIPIENT PROFILE URLS?/i],
+    date: [/^DATE$/i, /Sent On/i],
+    content: [/^CONTENT$/i, /Message/i]
+  };
+  
+  let processedCount = 0;
+  for (const row of dataRows) {
+    const conversationId = getValueByAliases(row, headers, aliases.convoId);
+    const from = getValueByAliases(row, headers, aliases.from);
+    const to = getValueByAliases(row, headers, aliases.to);
+    const senderUrl = getValueByAliases(row, headers, aliases.fromUrl);
+    const recipientUrls = getValueByAliases(row, headers, aliases.toUrls);
+    const date = getValueByAliases(row, headers, aliases.date);
+    const content = getValueByAliases(row, headers, aliases.content);
+    
+    if (!content) {
+      continue; // Skip empty messages
+    }
+    
+    const ts = parseTimestamp(date);
+    if (date && !ts) {
+      warnings.push(`Messages: Could not parse date "${date}"`);
+    }
+    
+    // Determine meOrThem (case-insensitive)
+    const meOrThem = from.toLowerCase().includes('you') ? 'me' : 'them';
+    
+    // Determine threadId
+    let threadId: string;
+    if (conversationId) {
+      threadId = conversationId;
+    } else {
+      // Fallback logic
+      const recipients = recipientUrls.split(',').map(url => normalizeText(url)).filter(Boolean);
+      
+      if (recipients.length === 1) {
+        threadId = await stableHash(recipients[0]);
+      } else if (recipients.length > 1) {
+        const sortedUrls = recipients.sort().join('|');
+        threadId = await stableHash(sortedUrls);
+      } else {
+        const participant = to || from;
+        const dayBucket = getDayBucket(ts);
+        threadId = await stableHash(`${participant}|${dayBucket}`);
+      }
+    }
+    
+    // Determine otherId
+    let otherId = '';
+    if (meOrThem === 'them') {
+      otherId = senderUrl;
+    } else {
+      const recipients = recipientUrls.split(',').map(url => normalizeText(url)).filter(Boolean);
+      otherId = recipients[0] || '';
+    }
+    
+    const id = await stableHash(`${threadId}|${ts}|${content.substring(0, 40)}`);
+    
+    messages.push({
+      id,
+      threadId,
+      meOrThem,
+      otherId,
+      body: content,
+      ts
+    });
+    
+    processedCount++;
+  }
+  
+  warnings.push(`Messages: ${processedCount} messages processed from ${fileName}`);
+  return messages;
+}
+
+// Process Invitations file with robust header detection
+async function processInvitations(rawData: any[], warnings: string[], fileName: string): Promise<Invite[]> {
+  const invites: Invite[] = [];
+  
+  if (rawData.length < 2) {
+    warnings.push(`Invitations: Insufficient data in ${fileName}`);
+    return invites;
+  }
+  
+  const headers = rawData[0].map((cell: any) => normalizeText(cell));
+  const dataRows = rawData.slice(1).filter(row => 
+    Array.isArray(row) && row.some(cell => normalizeText(cell))
+  );
+  
+  // Diagnostics
+  warnings.push(`Invitations: Detected headers: ${headers.join(' | ')}`);
+  warnings.push(`Invitations: ${dataRows.length} data rows found in ${fileName}`);
+  
+  // Header aliases
+  const aliases = {
+    from: ["From"],
+    to: ["To"],
+    sentAt: ["Sent At", "Date", "Sent On"],
+    message: ["Message", "Note"],
+    direction: ["Direction", "Type"],
+    inviterUrl: ["inviterProfileUrl", "Inviter Profile URL"],
+    inviteeUrl: ["inviteeProfileUrl", "Invitee Profile URL"]
+  };
+  
+  let processedCount = 0;
+  for (const row of dataRows) {
+    const from = getValueByAliases(row, headers, aliases.from);
+    const to = getValueByAliases(row, headers, aliases.to);
+    const sentAt = getValueByAliases(row, headers, aliases.sentAt);
+    const message = getValueByAliases(row, headers, aliases.message);
+    const direction = getValueByAliases(row, headers, aliases.direction);
+    
+    if (!from && !to) {
+      continue; // Skip rows with no participants
+    }
+    
+    const ts = parseTimestamp(sentAt);
+    if (sentAt && !ts) {
+      warnings.push(`Invitations: Could not parse date "${sentAt}"`);
+    }
+    
+    // Determine direction
+    let inviteDirection: 'sent' | 'received';
+    if (direction.toLowerCase().includes('outgoing')) {
+      inviteDirection = 'sent';
+    } else if (direction.toLowerCase().includes('incoming')) {
+      inviteDirection = 'received';
+    } else {
+      inviteDirection = from.toLowerCase().includes('you') ? 'sent' : 'received';
+    }
+    
+    const counterpartName = inviteDirection === 'sent' ? to : from;
+    const id = await stableHash(`${inviteDirection}|${counterpartName}|${ts}`);
+    
+    invites.push({
+      id,
+      direction: inviteDirection,
+      counterpartName,
+      status: 'unknown',
+      message: message || undefined,
+      ts
+    });
+    
+    processedCount++;
+  }
+  
+  warnings.push(`Invitations: ${processedCount} invitations processed from ${fileName}`);
+  return invites;
+}
+
+// Process Company Follows file with robust header detection
+async function processCompanyFollows(rawData: any[], warnings: string[], fileName: string): Promise<CompanyFollow[]> {
+  const follows: CompanyFollow[] = [];
+  
+  if (rawData.length < 2) {
+    warnings.push(`Company Follows: Insufficient data in ${fileName}`);
+    return follows;
+  }
+  
+  const headers = rawData[0].map((cell: any) => normalizeText(cell));
+  const dataRows = rawData.slice(1).filter(row => 
+    Array.isArray(row) && row.some(cell => normalizeText(cell))
+  );
+  
+  // Diagnostics
+  warnings.push(`Company Follows: Detected headers: ${headers.join(' | ')}`);
+  warnings.push(`Company Follows: ${dataRows.length} data rows found in ${fileName}`);
+  
+  // Header aliases
+  const aliases = {
+    org: ["Organization", "Company"],
+    followed: ["Followed On", "Date"]
+  };
+  
+  let processedCount = 0;
+  for (const row of dataRows) {
+    const organization = getValueByAliases(row, headers, aliases.org);
+    const followedOn = getValueByAliases(row, headers, aliases.followed);
+    
+    if (!organization) {
+      continue; // Skip rows with no organization
+    }
+    
+    const ts = parseTimestamp(followedOn);
+    if (followedOn && !ts) {
+      warnings.push(`Company Follows: Could not parse date "${followedOn}"`);
+    }
+    
+    const id = await stableHash(`${organization}|${ts}`);
+    
+    follows.push({
+      id,
+      company: organization,
+      ts
+    });
+    
+    processedCount++;
+  }
+  
+  warnings.push(`Company Follows: ${processedCount} follows processed from ${fileName}`);
+  return follows;
+}
+
+// Process Saved Jobs file with robust header detection
+async function processSavedJobs(rawData: any[], warnings: string[], fileName: string, isApplications = false): Promise<SavedJob[]> {
+  const jobs: SavedJob[] = [];
+  
+  if (rawData.length < 2) {
+    warnings.push(`${isApplications ? 'Job Applications' : 'Saved Jobs'}: Insufficient data in ${fileName}`);
+    return jobs;
+  }
+  
+  const headers = rawData[0].map((cell: any) => normalizeText(cell));
+  const dataRows = rawData.slice(1).filter(row => 
+    Array.isArray(row) && row.some(cell => normalizeText(cell))
+  );
+  
+  const fileType = isApplications ? 'Job Applications' : 'Saved Jobs';
+  
+  // Diagnostics
+  warnings.push(`${fileType}: Detected headers: ${headers.join(' | ')}`);
+  warnings.push(`${fileType}: ${dataRows.length} data rows found in ${fileName}`);
+  
+  // Header aliases
+  const aliases = {
+    title: ["Title", "Job Title"],
+    company: ["Company", "Company Name"],
+    ts: ["Saved On", "Date", "Applied On", "Application Date", "Created On"]
+  };
+  
+  let processedCount = 0;
+  for (const row of dataRows) {
+    const title = getValueByAliases(row, headers, aliases.title);
+    const company = getValueByAliases(row, headers, aliases.company);
+    const dateValue = getValueByAliases(row, headers, aliases.ts);
+    
+    // Keep rows with title OR company present
+    if (!title && !company) {
+      continue;
+    }
+    
+    const ts = parseTimestamp(dateValue);
+    if (dateValue && !ts) {
+      warnings.push(`${fileType}: Could not parse date "${dateValue}"`);
+    }
+    
+    const id = await stableHash(`${company}|${title}|${ts}`);
+    
+    jobs.push({
+      id,
+      company: company || 'Unknown',
+      title: title || 'Unknown',
+      ts
+    });
+    
+    processedCount++;
+  }
+  
+  warnings.push(`${fileType}: ${processedCount} jobs processed from ${fileName}`);
+  return jobs;
+}
+
 // Main worker message handler
 self.addEventListener('message', async (event) => {
   const files: File[] = event.data;
@@ -390,13 +524,19 @@ self.addEventListener('message', async (event) => {
   };
   
   // Extract files from ZIP or process individual files
-  let filesToProcess: { name: string; content: string | ArrayBuffer }[] = [];
+  let filesToProcess: { name: string; content: string | ArrayBuffer; originalName: string }[] = [];
   
   for (const file of files) {
     if (file.name.toLowerCase().endsWith('.zip')) {
       try {
         const extractedFiles = await extractZipFiles(file);
-        filesToProcess.push(...extractedFiles);
+        for (const extracted of extractedFiles) {
+          filesToProcess.push({ 
+            name: extracted.name, 
+            content: extracted.content,
+            originalName: file.name
+          });
+        }
         payload.summary.warnings.push(`Extracted ${extractedFiles.length} files from ${file.name}`);
       } catch (error) {
         payload.summary.warnings.push(`Failed to extract ZIP file ${file.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -414,10 +554,10 @@ self.addEventListener('message', async (event) => {
         try {
           if (fileName.endsWith('.csv')) {
             const content = await file.text();
-            filesToProcess.push({ name: file.name, content });
+            filesToProcess.push({ name: file.name, content, originalName: file.name });
           } else if (fileName.endsWith('.xlsx')) {
             const content = await file.arrayBuffer();
-            filesToProcess.push({ name: file.name, content });
+            filesToProcess.push({ name: file.name, content, originalName: file.name });
           }
         } catch (error) {
           payload.summary.warnings.push(`Failed to read file ${file.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -463,28 +603,28 @@ self.addEventListener('message', async (event) => {
         continue;
       }
       
-      payload.summary.filesProcessed.push(fileType);
+      payload.summary.filesProcessed.push(`${fileType} (${fileData.originalName})`);
       payload.summary.rows[fileType] = data.length;
       
       // Process data based on file type
       switch (fileType) {
         case 'Connections':
-          payload.contacts = processConnections(data, payload.summary.warnings);
+          payload.contacts = await processConnections(data, payload.summary.warnings, fileData.name);
           break;
         case 'messages':
-          payload.messages = processMessages(data, payload.summary.warnings);
+          payload.messages = await processMessages(data, payload.summary.warnings, fileData.name);
           break;
         case 'Invitations':
-          payload.invites = processInvitations(data, payload.summary.warnings);
+          payload.invites = await processInvitations(data, payload.summary.warnings, fileData.name);
           break;
         case 'Company Follows':
-          payload.companyFollows = processCompanyFollows(data, payload.summary.warnings);
+          payload.companyFollows = await processCompanyFollows(data, payload.summary.warnings, fileData.name);
           break;
         case 'Saved Jobs':
-          payload.savedJobs.push(...processSavedJobs(data, payload.summary.warnings, false));
+          payload.savedJobs.push(...await processSavedJobs(data, payload.summary.warnings, fileData.name, false));
           break;
         case 'Job Applications':
-          payload.savedJobs.push(...processSavedJobs(data, payload.summary.warnings, true));
+          payload.savedJobs.push(...await processSavedJobs(data, payload.summary.warnings, fileData.name, true));
           break;
       }
       

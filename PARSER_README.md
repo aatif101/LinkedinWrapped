@@ -7,11 +7,12 @@ This implementation provides a complete Web Worker-based parser for LinkedIn exp
 ### Core Parser Worker (`src/workers/parser.worker.ts`)
 - **ZIP File Support**: Automatically extracts LinkedIn export ZIP files using JSZip
 - **CSV/XLSX Support**: Uses PapaParse and SheetJS for robust file parsing
-- **File Type Detection**: Automatically identifies LinkedIn export files by name
+- **Resilient Header Detection**: Comprehensive alias mapping for all LinkedIn export variations
+- **Robust Diagnostics**: Detailed logging of headers, row counts, and processing steps
 - **Data Normalization**: Implements all specified normalization rules
-- **Stable ID Generation**: Uses deterministic hashing for consistent IDs
-- **Timestamp Parsing**: Handles various LinkedIn timestamp formats
-- **Error Handling**: Comprehensive error reporting and warnings
+- **Stable ID Generation**: Uses SHA-1 based deterministic hashing for consistent IDs
+- **Timestamp Parsing**: Handles various LinkedIn timestamp formats with graceful failures
+- **Error Recovery**: Never drops rows for unparseable timestamps, keeps data with empty fields
 
 ### Supported File Types
 ✅ **Connections.csv/.xlsx** - Contact information and connection dates  
@@ -47,12 +48,14 @@ Validates all specified requirements:
 4. ✅ **Invite Direction**: `Direction="OUTGOING"` → `direction === "sent"`
 5. ✅ **Job Data**: Both Saved Jobs and Job Applications → Unified `SavedJob` format
 
-### Data Normalization Features
+### Enhanced Data Normalization Features
 - **BOM Removal**: Strips Unicode byte order marks
 - **Whitespace Cleanup**: Trims and collapses multiple spaces
-- **Header Flexibility**: Case-insensitive header matching
-- **Notes Skipping**: Automatically skips LinkedIn's "Notes:" preamble
-- **Missing Field Handling**: Graceful handling of empty/missing cells
+- **Header Flexibility**: Comprehensive alias mapping with regex support
+- **Smart Preface Skipping**: Automatically finds header rows for all file types
+- **Missing Field Handling**: Never drops rows, uses defaults for missing fields
+- **Robust Diagnostics**: Logs detected headers, row counts, and processing steps
+- **SHA-1 Hashing**: Deterministic ID generation for data consistency
 
 ## 🚀 Usage
 
@@ -93,27 +96,55 @@ src/
 - **Error Recovery**: Continues processing even if some files fail
 - **ZIP Support**: Handles LinkedIn's native ZIP export format automatically
 
-## 📊 Processing Summary
+## 📊 Enhanced Processing Summary & Diagnostics
 
-After upload, you'll see:
+After upload, you'll see comprehensive diagnostics in the console:
+
+### 🔍 Diagnostic Logging
+- **Files Processed**: Original filenames and detected types
+- **Header Detection**: Exact headers found in each file
+- **Row Counts**: Raw rows vs. processed data counts
+- **Processing Steps**: Detailed log of each file's processing
+- **First 10 Warnings**: Most important issues and anomalies
+
+### 📈 Data Summary
 - **Data Counts**: Number of contacts, messages, invites, etc.
 - **Files Processed**: Which LinkedIn export files were recognized
 - **Warnings**: Any data quality issues or parsing problems
 - **Validation Results**: Confirmation that parsing meets specifications
 
+### Example Console Output:
+```
+🔍 Parser Diagnostics Report
+============================
+
+📁 Files Processed:
+  1. Connections (LinkedIn_Export.zip)
+  2. messages (LinkedIn_Export.zip)
+
+📊 Row Counts:
+  Connections: 1250 rows
+  messages: 3420 rows
+
+⚠️  Processing Warnings (first 10):
+  1. Connections: Detected headers: First Name | Last Name | URL | Company | Position | Connected On
+  2. Connections: 1249 data rows found in Connections.csv
+  3. Connections: 1249 contacts processed from Connections.csv
+  ...
+```
+
 ## 🔧 Technical Implementation
 
-### Hash Function
-Uses a simple but deterministic hash for stable IDs:
+### Enhanced Hash Function
+Uses SHA-1 based deterministic hashing for stable IDs:
 ```typescript
-function simpleHash(input: string): string {
-  let hash = 0;
-  for (let i = 0; i < input.length; i++) {
-    const char = input.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString(36);
+async function stableHash(input: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(input);
+  const hashBuffer = await crypto.subtle.digest('SHA-1', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  return hashHex.substring(0, 12); // Use first 12 chars for shorter IDs
 }
 ```
 

@@ -162,16 +162,18 @@ const Wrapped = () => {
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.5, delay: 0.3 }}
-                className="bg-yellow-500/10 border border-yellow-400/30 rounded-lg p-4"
+                className="bg-yellow-500/10 border border-yellow-400/30 rounded-lg p-4 max-h-96 overflow-y-auto"
               >
-                <h3 className="text-yellow-300 font-medium mb-2">Processing Notes:</h3>
+                <h3 className="text-yellow-300 font-medium mb-2">
+                  Processing Notes: ({parsedData.summary.warnings.length} total)
+                </h3>
                 <ul className="text-yellow-200/80 text-sm space-y-1">
-                  {parsedData.summary.warnings.slice(0, 5).map((warning, index) => (
-                    <li key={index}>• {warning}</li>
+                  {parsedData.summary.warnings.map((warning, index) => (
+                    <li key={index} className="font-mono text-xs">
+                      <span className="text-yellow-400 mr-2">{index + 1}.</span>
+                      {warning}
+                    </li>
                   ))}
-                  {parsedData.summary.warnings.length > 5 && (
-                    <li>• ...and {parsedData.summary.warnings.length - 5} more</li>
-                  )}
                 </ul>
               </motion.div>
             )}

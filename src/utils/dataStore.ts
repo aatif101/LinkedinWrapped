@@ -1,5 +1,6 @@
 import type { ParsedPayload } from '../types/parser';
 import { runValidationTests } from './parserValidation';
+import { logParserDiagnostics } from './diagnosticLogger';
 
 // In-memory data store
 let parsedData: ParsedPayload | null = null;
@@ -7,14 +8,9 @@ let parsedData: ParsedPayload | null = null;
 export const dataStore = {
   setParsedData: (data: ParsedPayload) => {
     parsedData = data;
-    console.log('Data stored:', {
-      contacts: data.contacts.length,
-      messages: data.messages.length,
-      invites: data.invites.length,
-      companyFollows: data.companyFollows.length,
-      savedJobs: data.savedJobs.length,
-      summary: data.summary
-    });
+    
+    // Log comprehensive diagnostics
+    logParserDiagnostics(data);
     
     // Run validation tests
     runValidationTests(data);
