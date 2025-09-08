@@ -113,6 +113,18 @@ async function extractZipFiles(zipFile: File): Promise<{ name: string; content: 
     
     const lowerName = fileName.toLowerCase();
     
+    // Check if this is a messages file
+    if (lowerName.includes('messages')) {
+      // Only process canonical messages.csv file
+      const basename = fileName.split('/').pop()?.toLowerCase() || '';
+      const isCanonicalMessages = basename === 'messages.csv' || fileName.toLowerCase().endsWith('/messages.csv');
+      
+      if (!isCanonicalMessages) {
+        // Skip auxiliary message files - we'll add warning later in processing
+        continue;
+      }
+    }
+    
     // Only extract recognized LinkedIn export files
     const isRelevantFile = [
       'connections', 'messages', 'invitations', 
@@ -545,6 +557,19 @@ self.addEventListener('message', async (event) => {
     } else {
       // Handle individual files (for backward compatibility)
       const fileName = file.name.toLowerCase();
+      
+      // Check for auxiliary message files first
+      if (fileName.includes('messages')) {
+        const basename = file.name.split('/').pop() || '';
+        const isCanonicalMessages = basename.toLowerCase() === 'messages.csv' || fileName.endsWith('/messages.csv');
+        
+        if (!isCanonicalMessages) {
+          // This is an auxiliary message file - add warning and skip
+          payload.summary.warnings.push(`Ignoring auxiliary messages file ${basename}`);
+          continue;
+        }
+      }
+      
       const isRelevantFile = [
         'connections', 'messages', 'invitations', 
         'company follows', 'saved jobs', 'job applications'
@@ -572,6 +597,18 @@ self.addEventListener('message', async (event) => {
   for (const fileData of filesToProcess) {
     const fileName = fileData.name.toLowerCase();
     let fileType = '';
+    
+    // Check for auxiliary message files first
+    if (fileName.includes('messages')) {
+      const basename = fileData.name.split('/').pop() || '';
+      const isCanonicalMessages = basename.toLowerCase() === 'messages.csv' || fileName.endsWith('/messages.csv');
+      
+      if (!isCanonicalMessages) {
+        // This is an auxiliary message file - add warning and skip
+        payload.summary.warnings.push(`Ignoring auxiliary messages file ${basename}`);
+        continue;
+      }
+    }
     
     // Determine file type based on name
     if (fileName.includes('connections')) {
